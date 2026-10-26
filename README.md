@@ -1,5 +1,7 @@
 # ChatGPT Web MCP Agent Channel
 
+[简体中文](README.zh-CN.md)
+
 A Codex Skill and PowerShell helper for giving each Windows Agent its own `chatgpt-web-mcp` process, Chrome Profile, CDP port, state/log paths, and conversation binding.
 
 ## Requirements
