@@ -1,12 +1,20 @@
-import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 export const CHATGPT_URL = process.env.CHATGPT_WEB_URL || "https://chatgpt.com/";
 
+export const BROWSER_HOST_ROOT = path.resolve(
+  process.env.CHATGPT_WEB_BROWSER_HOST_ROOT ||
+    path.join(os.homedir(), ".chatgpt-web-mcp", "browser-host"),
+);
+
+export const BROWSER_HOST_FILE = path.resolve(
+  process.env.CHATGPT_WEB_BROWSER_HOST_FILE || path.join(BROWSER_HOST_ROOT, "host.json"),
+);
+
 export const USER_DATA_DIR = path.resolve(
   process.env.CHATGPT_WEB_PROFILE ||
-    path.join(os.homedir(), ".chatgpt-web-mcp", "chrome-profile"),
+    path.join(BROWSER_HOST_ROOT, "profile"),
 );
 
 export const AGENT_ID = process.env.CHATGPT_WEB_AGENT_ID || null;
@@ -20,70 +28,6 @@ export const BINDING_MARKER = process.env.CHATGPT_WEB_BINDING_MARKER || null;
 export const AGENT_LOG_FILE = path.resolve(
   process.env.CHATGPT_WEB_AGENT_LOG ||
     path.join(os.homedir(), ".chatgpt-web-mcp", "agent-messages.jsonl"),
-);
-
-function unique(items) {
-  return [...new Set(items.filter(Boolean))];
-}
-
-export function chromeExecutableCandidates({
-  platform = process.platform,
-  env = process.env,
-  home = os.homedir(),
-} = {}) {
-  if (env.CHATGPT_WEB_CHROME) return [path.resolve(env.CHATGPT_WEB_CHROME)];
-
-  if (platform === "darwin") {
-    return unique([
-      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-      "/Applications/Chromium.app/Contents/MacOS/Chromium",
-      "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-      path.join(home, "Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-      path.join(home, "Applications/Chromium.app/Contents/MacOS/Chromium"),
-    ]);
-  }
-
-  if (platform === "win32") {
-    return unique([
-      env.LOCALAPPDATA && path.join(env.LOCALAPPDATA, "Google/Chrome/Application/chrome.exe"),
-      env.PROGRAMFILES && path.join(env.PROGRAMFILES, "Google/Chrome/Application/chrome.exe"),
-      env["PROGRAMFILES(X86)"] &&
-        path.join(env["PROGRAMFILES(X86)"], "Google/Chrome/Application/chrome.exe"),
-      env.PROGRAMFILES && path.join(env.PROGRAMFILES, "Microsoft/Edge/Application/msedge.exe"),
-      env["PROGRAMFILES(X86)"] &&
-        path.join(env["PROGRAMFILES(X86)"], "Microsoft/Edge/Application/msedge.exe"),
-    ]);
-  }
-
-  const pathEntries = String(env.PATH || "")
-    .split(path.delimiter)
-    .filter(Boolean);
-  const executableNames = [
-    "google-chrome-stable",
-    "google-chrome",
-    "chromium",
-    "chromium-browser",
-    "microsoft-edge-stable",
-    "microsoft-edge",
-  ];
-  return unique(
-    pathEntries.flatMap((directory) =>
-      executableNames.map((name) => path.join(directory, name)),
-    ),
-  );
-}
-
-export function resolveChromeExecutable(options = {}) {
-  const candidates = chromeExecutableCandidates(options);
-  const env = options.env || process.env;
-  if (env.CHATGPT_WEB_CHROME) return candidates[0] || null;
-  return candidates.find((candidate) => fs.existsSync(candidate)) || null;
-}
-
-export const CHROME_EXECUTABLE = resolveChromeExecutable();
-
-export const HEADLESS = /^(1|true|yes)$/i.test(
-  process.env.CHATGPT_WEB_HEADLESS || "false",
 );
 
 export const ACTION_TIMEOUT_MS = Number(
@@ -183,11 +127,6 @@ export const PROBE_POLICY_KEY = [
   PROBE_FALLBACK_PATTERN,
 ].join("\n");
 
-export const BROWSER_STATE_FILE = path.resolve(
-  process.env.CHATGPT_WEB_BROWSER_STATE ||
-    path.join(os.homedir(), ".chatgpt-web-mcp", "browser-state.json"),
-);
-
 export const RUNTIME_STATE_FILE = path.resolve(
   process.env.CHATGPT_WEB_RUNTIME_STATE ||
     path.join(os.homedir(), ".chatgpt-web-mcp", "runtime-state.json"),
@@ -195,10 +134,16 @@ export const RUNTIME_STATE_FILE = path.resolve(
 
 export const RUNTIME_LOCK_FILE = `${RUNTIME_STATE_FILE}.lock`;
 
-export const OPERATION_LOCK_FILE = path.resolve(
-  process.env.CHATGPT_WEB_OPERATION_LOCK ||
-    path.join(os.homedir(), ".chatgpt-web-mcp", "browser-operation.lock"),
+export const OPERATION_LOCK_DIR = path.resolve(
+  process.env.CHATGPT_WEB_OPERATION_LOCK_DIR || path.join(BROWSER_HOST_ROOT, "locks"),
 );
+
+export const SEND_SCHEDULER_FILE = path.resolve(
+  process.env.CHATGPT_WEB_SEND_SCHEDULER_FILE ||
+    path.join(BROWSER_HOST_ROOT, "send-scheduler.json"),
+);
+
+export const SEND_SCHEDULER_LOCK_FILE = `${SEND_SCHEDULER_FILE}.lock`;
 
 export const NETWORK_LOG_FILE = path.resolve(
   process.env.CHATGPT_WEB_NETWORK_LOG ||

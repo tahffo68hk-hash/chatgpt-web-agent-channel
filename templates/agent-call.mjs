@@ -27,16 +27,28 @@ try {
     ? await client.listTools()
     : await client.callTool({ name: toolName, arguments: input });
 
-  const stateText = await fs.readFile(instance.browser_state_file, "utf8").catch(() => null);
+  const hostStatePath = instance.browser_host_manifest || instance.browser_state_file;
+  const stateText = await fs.readFile(hostStatePath, "utf8").catch(() => null);
   if (stateText) {
     const state = JSON.parse(stateText);
     if (path.resolve(state.profile || "").toLowerCase() !== path.resolve(instance.browser_profile).toLowerCase()) {
-      throw new Error("Browser state does not belong to this Agent's Profile.");
+      throw new Error("Browser Host manifest Profile does not match this Agent's shared Host.");
+    }
+    if (instance.browser_host_id && state.host_id !== instance.browser_host_id) {
+      throw new Error("Browser Host ID changed; refusing to switch this Agent to another Host silently.");
+    }
+    if (!Number.isInteger(Number(state.pid)) || !Number.isInteger(Number(state.port)) || !state.endpoint) {
+      throw new Error("Browser Host manifest is missing its verified PID, CDP port, or endpoint.");
     }
     instance.cdp_port = Number(state.port) || null;
+    instance.browser_host_id = state.host_id || null;
     const temporaryPath = `${instancePath}.${process.pid}.tmp`;
-    await fs.writeFile(temporaryPath, `${JSON.stringify(instance, null, 2)}\n`);
-    await fs.rename(temporaryPath, instancePath);
+    try {
+      await fs.writeFile(temporaryPath, `${JSON.stringify(instance, null, 2)}\n`, "utf8");
+      await fs.rename(temporaryPath, instancePath);
+    } finally {
+      await fs.unlink(temporaryPath).catch(() => {});
+    }
   }
 
   console.log(JSON.stringify(result, null, 2));

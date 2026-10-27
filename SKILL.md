@@ -1,55 +1,55 @@
 ---
 name: chatgpt-web-agent-channel
-description: Set up, repair, or verify a persistent per-Agent chatgpt-web-mcp channel on Windows with Codex. Use it when an Agent needs its own MCP server entry, Chrome profile/CDP port, state/log directories, or ChatGPT conversation binding, especially when another Agent already uses the shared ChatGPT web MCP. Also trigger for Chinese requests such as 给每个 Agent 配独立 ChatGPT MCP、解决会话串线、隔离 Chrome Profile 或固定 conversation_id. Do not use it for ordinary ChatGPT conversations.
+description: Use when a Codex conversation needs ChatGPT Web through chatgpt-web-mcp, especially when new conversations keep creating Chrome profiles or asking for repeated sign-ins, or when Agents need separate ChatGPT conversations in one already-signed-in browser.
 ---
 
-# Per-Agent ChatGPT Web MCP channel
+# Reuse one signed-in ChatGPT browser
 
-Use this skill when an Agent needs a durable ChatGPT web channel that cannot inherit another Agent's browser profile, CDP port, conversation binding, or message state.
+Connect every Agent to one persistent, already-signed-in Chrome Browser Host. Give each Codex conversation its own MCP process, stable Agent ID, state, logs, and ChatGPT `conversation_id`. Never create a Chrome Profile per Agent.
 
-## Compatibility
+## Required behavior
 
-This package targets Windows and Codex Desktop. It reuses an installed `chatgpt-web-mcp` checkout and its existing `node_modules`; it does not install the MCP or its dependencies. The bundled runtime overlay matches upstream `chatgpt-web-mcp` version `0.2.1`, commit `d6c1909151d9d13b439af1f519513ebee2267893`. For another source version, use a known-compatible local Agent runtime template or inspect and adapt the overlay to that version before starting it. Do not assume a code patch is compatible just because the package version string matches.
+- Reuse a verified Browser Host from `%USERPROFILE%\.chatgpt-web-mcp\browser-host\host.json` when present. Check its PID, existing Profile, and loopback CDP port before connecting.
+- If no Host exists, initialize it only from an existing Chrome user-data directory selected by the user. Use `-BrowserHostProfile` to name that exact directory. The manager may adopt the running browser if CDP is already enabled, or start the same existing directory after it is closed normally. It must never create an empty Profile, copy cookies, or silently choose another browser.
+- If Chrome is running without a verifiable CDP endpoint, stop. Explain that this MCP cannot attach to that process as launched. Ask before any browser restart, and reuse the same on-disk directory if the user approves. Never terminate Chrome automatically.
+- If the existing browser cannot expose a supported CDP endpoint, stop and explain the limitation. Do not work around it by making a new Profile or asking the user to sign in again in a per-Agent browser.
+- Every Agent keeps its own named stdio MCP entry, stable `AGENT_ID`, state/log directories, binding file, and unique ChatGPT conversation. Agents share only the Browser Host and login session.
+- Select a bound tab only by the saved `conversation_id`; never use tab order, active-window state, or another Agent's reply cursor. Serialize writes to the same conversation.
+- Do not alter another Agent's MCP process, binding, Profile, state, logs, or Codex configuration entry.
 
-## Keep the setup small
+## Create or join an Agent
 
-- Reuse the installed `chatgpt-web-mcp` source and `node_modules`. Do not reinstall packages or edit the shared source tree.
-- Keep one stable `AGENT_ID` for this Agent. Reuse the ID in its `instance.json` on restarts; never generate a new ID each launch.
-- Give the Agent its own named MCP server, Chrome Profile, dynamic CDP port, state, logs, binding file, and ChatGPT conversation.
-- Do not stop or rewrite another Agent's MCP process, browser, profile, binding, or configuration entry. Do not copy cookies or credentials.
-- Keep routing checks to the useful invariants: this Agent's ID, its own browser profile/CDP process, and the bound conversation ID on `chatgpt.com`. A separate full-URL string comparison after matching host and conversation ID is redundant.
-- Do not choose a tab by order or active-window state. Once bound, select the page by the saved conversation ID. Serialize writes within this Agent's MCP instance.
-
-## Set up an instance
-
-1. Inspect only the relevant Codex MCP entry, `chatgpt-web-mcp` source/dependencies, matching Chrome process/CDP state, and existing Agent instance/binding files. Reuse an existing instance for this Agent if one is already recorded.
-2. If this is a new Agent, make a unique ID once, such as `ag-codex-<uuid>`, and save it in the new `instance.json`. The helper uses the bundled overlay for its pinned upstream revision. If the local MCP checkout differs, use a healthy, compatible per-Agent runtime template or adapt the overlay to the installed source first. Never copy another Agent's `instance.json`, binding, state, logs, or Chrome Profile.
-3. Scaffold the new directories and named Codex server entry with the helper. Supply the existing source, Node, Chrome, and Codex config paths found during inspection:
+1. Inspect only the relevant MCP entry, existing Browser Host manifest, Chrome process/CDP endpoint, and this Agent's instance/binding files. Reuse this conversation's existing `AGENT_ID` on restarts.
+2. If `host.json` exists, run `scripts/browser-host.ps1 -Action Status` and confirm it is live. New Agent setup then reuses its exact Profile and port; it does not create or launch an Agent-specific Profile.
+3. If there is no Host, select the already-signed-in Chrome **user-data directory** (the parent of `Default`, not the `Default` folder) and initialize through the Agent helper:
 
    ```powershell
    & '<path-to-skill>\scripts\new-agent-instance.ps1' `
      -AgentId 'ag-codex-<uuid>' `
-     -SourceDir '<path-to-chatgpt-web-mcp>' `
-     -NodeExecutable '<path-to-existing-node.exe>' `
-     -ChromeExecutable '<path-to-chrome.exe>' `
-     -CodexConfigPath '<path-to-Codex-config.toml>'
+     -SourceDir '<existing-chatgpt-web-mcp-checkout>' `
+     -NodeExecutable '<existing-node.exe>' `
+     -ChromeExecutable '<chrome.exe>' `
+     -CodexConfigPath "$env:USERPROFILE\.codex\config.toml" `
+     -BrowserHostProfile '<existing-signed-in-Chrome-user-data-directory>'
    ```
 
-   `-TemplateAgentRoot` is optional when that instance contains a compatible runtime overlay. The helper creates only new Agent-specific paths, links to the existing dependencies, and adds an independently named MCP table under a short lock with atomic replacement. It refuses to overwrite an existing instance.
-4. Start the dedicated MCP with `agent-call.mjs chatgpt_status`. The server starts its own Chrome using the new Profile and allocates a free loopback CDP port. Read `browser-state.json` and verify the Chrome command line contains this Agent's exact `--user-data-dir` and `--remote-debugging-port`; record the observed port in `instance.json`.
-5. If the new Profile is signed out, ask the user to sign in normally in that Profile. Do not import cookies or tokens from any other browser.
-6. Bind one new, ordinary ChatGPT conversation through the dedicated instance using a unique Agent marker. Save the real conversation ID and URL to `bindings/<AGENT_ID>.json` and `instance.json`. Before saving, check that no other binding file already has that conversation ID. If an MCP send times out, inspect that exact conversation and its latest response before considering a retry; never resend blindly.
-7. Verify with the dedicated MCP that status and latest-response reads return the saved conversation ID, URL, and expected message. Start a fresh MCP client once to confirm it reconnects to the same Chrome process/Profile and binding.
-8. If the Codex config is not hot-reloaded, keep using this Agent's `agent-call.mjs` wrapper until the named MCP server appears after a Codex MCP reload. Do not use the legacy shared server as a fallback.
+   Omit `-BrowserHostProfile` only when joining a verified Host. If the profile is open without CDP, the helper refuses without creating an Agent. Do not close or restart it unless the user approves. If the same existing profile is signed out, ask the user to sign in there once; never create a replacement Profile.
 
-## Message routing
+4. The helper creates only Agent-specific MCP/state/log/binding resources and records the shared Host Profile. Bind one distinct `conversation_id` for this Agent after checking that no other binding claims it.
+5. Restart the named MCP entry or run that Agent's `agent-call.mjs chatgpt_status` after the prior MCP process has disconnected. Do not run a second wrapper process under the same Agent ID while its MCP is still active.
 
-- Send and read only through this Agent's named server/wrapper and bound conversation.
-- Keep per-request IDs and send round IDs in this Agent's log. Record actual ChatGPT message IDs when the UI/API exposes them; leave them null when unavailable instead of substituting request IDs.
-- Treat a timeout as an unknown delivery state. Read the latest response from the bound conversation first; retry only if the unique prompt is absent.
-- Do not treat another Agent's reply cursor, last response, state file, or pending task as this Agent's input.
-- Only claim dual-Agent concurrency after two known independent instances send unique prompts at the same time and each receives the reply from its own bound conversation. If the second Agent's independent route is not available, report that concurrency remains unverified.
+## Existing Agent migration
+
+Use `scripts/migrate-agent-to-shared-browser.ps1` for one selected, disconnected Agent. It preserves that Agent's ID, MCP name, conversation binding, message cursors, state, and logs while switching it to the already-verified shared Host. It does not copy, delete, or open the old Agent Profile. If no Host exists, pass `-BrowserHostProfile` for the already-signed-in directory; the same no-new-Profile rules apply.
+
+## Routing and recovery
+
+- Before a send, verify this Agent ID and its saved conversation ID. Read replies only from that conversation. A timeout is an unknown delivery state: inspect that exact conversation before retrying.
+- A missing Host or missing bound page is not permission to create a new Profile or select another tab. Reconnect to the saved Host; if the bound page is closed, open the exact saved conversation URL in the shared browser.
+- Chrome 136 and later ignores remote-debugging switches for the default Chrome data directory. If the existing signed-in browser cannot provide the CDP endpoint this MCP requires, stop and explain the incompatibility. Do not create a per-Agent Profile to bypass it. See [Chrome's remote-debugging change](https://developer.chrome.com/blog/remote-debugging-port).
+- An Agent MCP disconnect leaves the shared Chrome open. Stop the Browser Host only after every Agent has disconnected and the user explicitly asks to close it.
+- Claim cross-Agent concurrency only after two independent MCP processes send unique messages to different bound conversations and each receives the reply from its own conversation. Otherwise report it as unverified.
 
 ## Report
 
-Give the user the `AGENT_ID`, server name, CDP port, Profile path, conversation URL, instance/binding/config file links, and the exact startup/reconnect method. State which single-Agent and dual-Agent checks actually passed. Confirm which existing processes/config entries were left untouched. Mention if the current Codex session still needs an MCP reload.
+Report the stable Agent ID, named MCP server, shared Host ID/CDP port/Profile, conversation URL, instance/binding/config paths, startup/reconnect method, checks actually completed, whether two-Agent concurrency was tested, and which existing processes/configurations were left untouched. State clearly that all joined Agents share the authenticated Chrome session.

@@ -2,6 +2,10 @@
 
 日期：2026-10-27
 
+## 实施状态
+
+仓库已加入共享 Browser Host 管理器、Agent 连接与路由改动、实例创建和显式 Profile 接管脚本，以及中英文使用说明。Node.js 与 PowerShell 静态语法检查已通过。本次改动没有执行真实 ChatGPT 登录/重连或双 Agent 同时发送与回复核对，因此跨 Agent 并发隔离尚未验证。
+
 [English](2026-10-27-shared-chatgpt-browser-design.md)
 
 ## 问题
@@ -19,10 +23,10 @@
 ### 共享浏览器 Host
 
 - 在共同的 `chatgpt-web-mcp` 根目录下新增一个长期运行的浏览器 Host。它负责一个 Chrome 进程、一个共享 Profile、一个动态分配的本机回环 CDP 端口、浏览器状态和生命周期锁。
-- 如果 Host 尚不存在，首次设置时创建它。之后的 Agent 设置读取已持久化的状态并复用 Host。Host 生命周期锁必须保护并发启动，避免两个设置流程同时用同一个 Profile 启动 Chrome。
+- 首次设置时，将用户明确选择的、已经登录的 Chrome 用户数据目录登记为 Host。之后的 Agent 设置读取已持久化的状态并复用 Host。管理器使用以规范 Host 路径派生的 Windows 命名互斥锁，串行化并发启动、接管和关闭。设置流程永不创建新的 Chrome Profile。
 - 共享 Profile 只能由一个 Chrome 进程打开。启动时，浏览器 Host 必须检查记录的 PID、Profile 路径和 CDP 端口，再决定是否复用当前端点。
 - 只有浏览器 Host 管理器可以启动或终止 Chrome。Agent MCP 进程通过 CDP 连接，并在 MCP 调用结束时断开自己的控制器。Agent 生命周期工具不得终止共享 Chrome。
-- 用户在浏览器 Host 的 Profile 中正常登录一次。不会从其他 Profile 复制 Cookie。
+- Host 使用用户现有的登录会话，不会从其他 Profile 复制 Cookie。如果 Chrome 无法提供可验证的 CDP 端点，设置流程停止，不会启动 Agent 专属 Profile。
 
 ### Agent 专属 MCP 和对话路由
 
@@ -34,7 +38,7 @@
 
 ### 并发和生命周期
 
-- 所有 Agent 共用一个浏览器生命周期锁，串行化 Host 创建、会修改 Host 状态的健康检查以及关闭操作。
+- 所有 Agent 共用一个浏览器生命周期命名互斥锁，串行化 Host 创建、接管和关闭操作。
 - 同一个 ChatGPT 对话的写入由以 `conversation_id` 为键的锁串行化。不同对话使用不同锁，并操作各自定位到的页面对象。
 - 使用共享的账号级发送调度器，让多个 MCP 进程共同遵守配置的最小发送间隔，而不是分别按各自进程的计时器发送。
 - 每次发送前重新检查绑定的对话 ID，并在同一个页面核对回复。发送超时后先检查对应对话，再决定是否重试。
@@ -44,14 +48,15 @@
 ## 设置和兼容性
 
 - 更新 PowerShell 辅助脚本、启动器、运行时覆盖文件及中英文 README，以便创建或加入共享浏览器 Host，同时保留每个 Agent 的专属资源。
-- 新 Agent 设置时，如果现有 Host 的配置和进程检查通过，就复用它；否则创建一个 Host，并请用户在该 Profile 中登录。
-- 保留现有每 Agent Profile，不自动修改。现有安装必须由用户明确选择 Host Profile 后，才能通过迁移步骤加入共享 Host。迁移不得复制 Cookie；如果 Chrome 已在使用所选 Profile，迁移必须核对并接管该进程的 PID/CDP 端点，不得再启动另一个 Chrome。
+- 新 Agent 设置必须加入经过验证的 Host，或显式指定用户现有的已登录 Chrome 用户数据目录。Host 不存在时，辅助脚本只登记或启动这一个既有目录，绝不创建 `browser-host\profile` 或 Agent 专属 Profile。
+- 现有每 Agent Profile 保留原样，迁移后不再使用。现有安装通过显式迁移步骤加入已登记的共享 Host；共享 Profile 原样复用，不复制 Cookie。如果 Chrome 已打开该 Profile 但没有可验证的 CDP 端点，迁移会停止，并在重启浏览器前询问用户。
+- Chrome 136 及更新版本会忽略对默认 Chrome 数据目录启用远程调试的开关。如果所选现有浏览器无法提供本 MCP 所需的 CDP 端点，Skill 停止，不创建替代 Profile。
 - 运行时和启动错误应说明问题发生在 Host、Agent 绑定还是目标对话，并给出恢复方式，且保留其他 Agent 的文件和进程。
 
 ## 验收标准
 
-1. 第一个 Agent 启动一个浏览器 Host；第二个 Agent 连接到相同的 Chrome PID、Profile 和 CDP 端口，不会再启动另一个 Chrome 进程。
-2. 用户在 Host Profile 中登录一次后，新配置的 Agent 和 MCP 进程重启后仍能使用该登录态。
+1. 第一个 Agent 将现有已登录 Chrome 用户数据目录登记为 Browser Host；第二个 Agent 连接到相同的 Chrome PID、Profile 和 CDP 端口，不创建新 Profile。
+2. 新配置的 Agent 和 MCP 进程重启后仍使用该既有登录态。
 3. 两个 Agent 绑定不同的对话 ID。即使标签页顺序或焦点改变，各自仍只打开和读取自己的对话。
 4. 同时向两个不同对话发送唯一消息时，消息进入正确页面；发送遵守共享调度器，回复也归属到对应的对话 ID。
 5. 同一对话的写入会串行执行。发送超时后先核对是否已投递。
@@ -62,4 +67,4 @@
 
 - 使用此 Host 的所有 Agent 会共用同一个已认证的 ChatGPT 账号会话。对话路由仍然分开，但浏览器登录态是共享的。
 - 单个 Chrome 进程和账号级发送间隔可能限制吞吐量。不同对话可以使用独立写入锁，但仍须遵守 ChatGPT 账号实际施加的限制。
-- 现有每 Agent Profile 需要明确选择迁移方式；自动复制 Profile 数据会违反不复制 Cookie 的要求。
+- Chrome 必须提供受支持的 CDP 端点。若普通浏览器不兼容，Skill 不会静默换成新 Profile，因为那会要求用户重新登录，也不再使用用户指定的浏览器会话。

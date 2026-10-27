@@ -39,7 +39,7 @@ const server = new McpServer({
   version: "0.2.1",
 }, {
   instructions:
-    `${AGENT_ID ? `Agent ${AGENT_ID} 专属实例：只允许使用绑定对话；请求/回复以 agent_id、request_id、conversation_id、round_id 记账。发送超时先核对投递状态，禁止盲目重复。` : ""}默认保持专用浏览器和 ChatGPT 页面常驻，除非用户明确要求，否则绝不调用 chatgpt_close_browser。发送最小间隔 ${SEND_INTERVAL_MS / 1_000} 秒，对话变更最小间隔 ${CONVERSATION_CHANGE_INTERVAL_MS / 1_000} 秒，回答完成后再等 ${POST_RESPONSE_CONVERSATION_COOLDOWN_MS / 1_000} 秒才切换；这些是下限，不保证免于限流。新建前的额外刷新当前${REFRESH_BEFORE_NEW_CHAT ? "开启" : "关闭"}，由 CHATGPT_WEB_REFRESH_BEFORE_NEW_CHAT 控制。每次发送前仍刷新当前对话，并校验 URL、草稿和附件；检测到变化则停止。对话达到 ${MAX_CONVERSATION_TURNS} 轮或出现 maximum-length 错误时，原子发送会先读取完整 transcript 并归档到 ${CONTEXT_ARCHIVE_DIR}，再新建普通对话；直接 submit_prompt 则拦截。新任务优先用 chatgpt_route_new_chat，普通请求使用页面可用档位“${DEFAULT_ANSWER_TIER}”。${probeInstructions}`,
+    `${AGENT_ID ? `Agent ${AGENT_ID} 专属实例：只允许使用绑定对话；请求/回复以 agent_id、request_id、conversation_id、round_id 记账。发送超时先核对投递状态，禁止盲目重复。` : ""}多个 Agent 共用一个常驻 Browser Host 登录态，但每个 Agent 只访问自己的 conversation_id 页面。Agent MCP 断开时只断开 CDP 控制器，不关闭共享 Chrome；关闭 Host 只能由 Browser Host 管理器显式执行。所有实例共享最小发送间隔 ${SEND_INTERVAL_MS / 1_000} 秒；对话变更最小间隔 ${CONVERSATION_CHANGE_INTERVAL_MS / 1_000} 秒，回答完成后再等 ${POST_RESPONSE_CONVERSATION_COOLDOWN_MS / 1_000} 秒才切换；这些是下限，不保证免于限流。新建前的额外刷新当前${REFRESH_BEFORE_NEW_CHAT ? "开启" : "关闭"}，由 CHATGPT_WEB_REFRESH_BEFORE_NEW_CHAT 控制。每次发送前仍刷新当前对话，并校验 URL、草稿和附件；检测到变化则停止。对话达到 ${MAX_CONVERSATION_TURNS} 轮或出现 maximum-length 错误时，原子发送会先读取完整 transcript 并归档到 ${CONTEXT_ARCHIVE_DIR}，再新建普通对话；直接 submit_prompt 则拦截。新任务优先用 chatgpt_route_new_chat，普通请求使用页面可用档位“${DEFAULT_ANSWER_TIER}”。${probeInstructions}`,
 });
 
 function asResult(value, isError = false) {
@@ -88,6 +88,30 @@ async function writeAgentBinding(binding) {
     mode: 0o600,
   });
   await fs.rename(temporaryPath, BINDING_FILE);
+}
+
+async function assertConversationIsUnclaimed(conversationId) {
+  const bindingsDir = path.dirname(BINDING_FILE);
+  const entries = await fs.readdir(bindingsDir, { withFileTypes: true }).catch((error) => {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  });
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.toLowerCase().endsWith(".json")) continue;
+    const candidatePath = path.join(bindingsDir, entry.name);
+    let candidate;
+    try {
+      candidate = JSON.parse(await fs.readFile(candidatePath, "utf8"));
+    } catch (error) {
+      throw new Error(`Cannot verify conversation ownership because a binding file is unreadable: ${candidatePath}`, { cause: error });
+    }
+    if (
+      candidate?.conversation_id === conversationId &&
+      candidate?.agent_id !== AGENT_ID
+    ) {
+      throw new Error(`Conversation ${conversationId} is already bound to another Agent; refusing to claim it.`);
+    }
+  }
 }
 
 async function appendAgentLog(record) {
@@ -150,6 +174,7 @@ async function guardAgentRoute(name, input) {
   if (name === "chatgpt_list_history" || name === "chatgpt_search_history") {
     throw new Error("History listing is disabled for this Agent; use its bound conversation only.");
   }
+  await assertConversationIsUnclaimed(binding.conversation_id);
   if (name === "chatgpt_new_chat" || name === "chatgpt_route_new_chat") {
     throw new Error("This Agent is already bound; opening another conversation is refused.");
   }
@@ -161,6 +186,22 @@ async function guardAgentRoute(name, input) {
     throw new Error("Select this Agent's bound conversation by exact ID or URL only.");
   }
   const route = await browser.agentRouteSnapshot();
+  if (
+    binding.browser_host_id &&
+    (binding.browser_host_id !== route.hostId ||
+      path.resolve(String(binding.browser_profile || "")) !== path.resolve(String(route.profile || "")))
+  ) {
+    throw new Error("Browser Host identity or Profile differs from this Agent's saved binding.");
+  }
+  // An explicitly bound existing conversation may be opened from the signed-in
+  // ChatGPT home page. Never use this bootstrap to switch away from another
+  // conversation; the requested ID must already equal this Agent's binding.
+  if (name === "chatgpt_select_history" && requestedId === binding.conversation_id && !route.conversationId) {
+    const currentUrl = new URL(route.url);
+    if (currentUrl.protocol === "https:" && currentUrl.hostname === "chatgpt.com" && currentUrl.pathname === "/") {
+      return binding;
+    }
+  }
   assertAgentRoute({
     agentId: AGENT_ID,
     binding,
@@ -184,13 +225,28 @@ async function finishAgentRoute(name, input, binding, result, requestId, roundId
     name === "chatgpt_route_new_chat" ||
     (name === "chatgpt_send_message" && input.newChat && !input.temporary);
   if (!currentBinding?.conversation_id && initialConversation) {
-    if (!route.conversationId || !route.url.includes(`/c/${route.conversationId}`)) {
+    let routeParts = [];
+    try {
+      const parsedRoute = new URL(route.url);
+      routeParts = parsedRoute.pathname.split("/").filter(Boolean);
+      if (parsedRoute.hostname !== "chatgpt.com") routeParts = [];
+    } catch {
+      routeParts = [];
+    }
+    if (
+      !route.conversationId ||
+      routeParts.length !== 2 ||
+      routeParts[0] !== "c" ||
+      routeParts[1] !== route.conversationId
+    ) {
       throw new Error("New conversation did not return a real /c/<conversation_id> route.");
     }
+    await assertConversationIsUnclaimed(route.conversationId);
     currentBinding = {
       agent_id: AGENT_ID,
       mcp_server_name: MCP_SERVER_NAME,
       mcp_instance_id: AGENT_ID,
+      browser_host_id: route.hostId,
       cdp_port: route.port,
       browser_profile: route.profile,
       conversation_id: route.conversationId,
@@ -209,9 +265,16 @@ async function finishAgentRoute(name, input, binding, result, requestId, roundId
       requestedConversationId: null,
       observedUrl: route.url,
     });
-    if (sendTools.has(name) || ids.lastSentMessageId || ids.lastReceivedMessageId) {
+    if (
+      sendTools.has(name) ||
+      ids.lastSentMessageId ||
+      ids.lastReceivedMessageId ||
+      currentBinding.browser_host_id !== route.hostId ||
+      Number(currentBinding.cdp_port) !== Number(route.port)
+    ) {
       currentBinding = {
         ...currentBinding,
+        browser_host_id: route.hostId,
         cdp_port: route.port,
         last_sent_message_id: ids.lastSentMessageId || currentBinding.last_sent_message_id || null,
         last_received_message_id:
@@ -250,6 +313,7 @@ function tool(name, description, schema, handler, { allowDuringPause = false } =
     const roundId = AGENT_ID && sendTools.has(name) ? `round-${randomUUID()}` : null;
     let binding = null;
     try {
+      binding = await readAgentBinding();
       const result = await browser.runExclusive(
         async () => {
           binding = await guardAgentRoute(name, input);
@@ -257,7 +321,12 @@ function tool(name, description, schema, handler, { allowDuringPause = false } =
           const value = await handler(input);
           return finishAgentRoute(name, input, binding, value, requestId, roundId);
         },
-        { signal: extra.signal, name },
+        {
+          signal: extra.signal,
+          name,
+          agentId: AGENT_ID,
+          conversationId: binding?.conversation_id || null,
+        },
       );
       return asResult(result);
     } catch (error) {
@@ -281,7 +350,7 @@ function tool(name, description, schema, handler, { allowDuringPause = false } =
 
   tool(
   "chatgpt_status",
-  `检查专用浏览器、登录、当前对话、模式、临时对话和轮次状态（阈值 ${MAX_CONVERSATION_TURNS}）。仅在诊断或确需状态时调用；正常发送无需预先调用。默认不展开高级菜单。`,
+  `检查共享 Browser Host、登录、绑定对话、模式、临时对话和轮次状态（阈值 ${MAX_CONVERSATION_TURNS}）。仅在诊断或确需状态时调用；正常发送无需预先调用。默认不展开高级菜单。`,
   {
     includeSettings: z
       .boolean()
@@ -293,7 +362,7 @@ function tool(name, description, schema, handler, { allowDuringPause = false } =
 
 tool(
   "chatgpt_browser_lifecycle",
-  "读取专用 ChatGPT 浏览器的常驻状态。MCP 调用结束后浏览器会继续保持打开，后续调用直接接管，不重复进站。",
+  "读取共享 ChatGPT Browser Host 的常驻状态。MCP 调用结束后浏览器仍保持打开，后续 Agent 连接同一登录 Profile。",
   {},
   () => browser.browserLifecycle(),
   { allowDuringPause: true },
@@ -301,7 +370,7 @@ tool(
 
 tool(
   "chatgpt_close_browser",
-  "明确关闭 ChatGPT MCP 的专用常驻浏览器。仅在用户明确要求关闭时调用。",
+  "共享 Browser Host 不能由 Agent MCP 关闭；请在所有 Agent 断开后使用 Browser Host 管理器的 Stop 操作。",
   {},
   () => browser.terminateBrowser(),
   { allowDuringPause: true },

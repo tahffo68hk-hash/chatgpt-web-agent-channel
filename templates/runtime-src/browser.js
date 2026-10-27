@@ -1,6 +1,5 @@
 import fs from "node:fs/promises";
-import { spawn } from "node:child_process";
-import net from "node:net";
+import { createHash } from "node:crypto";
 import path from "node:path";
 
 import { chromium } from "playwright-core";
@@ -10,18 +9,16 @@ import {
   BINDING_FILE,
   ACTION_TIMEOUT_MS,
   AUTH_CACHE_MS,
+  BROWSER_HOST_ROOT,
   CHATGPT_URL,
-  CHROME_EXECUTABLE,
   CONVERSATION_CHANGE_INTERVAL_MS,
   CONTEXT_ARCHIVE_DIR,
   DEFAULT_ANSWER_TIER,
-  HEADLESS,
   HISTORY_QUIET_PERIOD_MS,
   MAX_HISTORY_RESULTS,
   MAX_CONVERSATION_TURNS,
-  BROWSER_STATE_FILE,
   NETWORK_LOG_FILE,
-  OPERATION_LOCK_FILE,
+  OPERATION_LOCK_DIR,
   PAGE_INTERACTION_INTERVAL_MS,
   PAGE_STARTUP_DELAY_MS,
   POST_BREAKER_COOLDOWN_MS,
@@ -42,9 +39,12 @@ import {
   RUNTIME_LOCK_FILE,
   RUNTIME_STATE_FILE,
   SEND_INTERVAL_MS,
+  SEND_SCHEDULER_FILE,
+  SEND_SCHEDULER_LOCK_FILE,
   SITE_ACTION_INTERVAL_MS,
   USER_DATA_DIR,
 } from "./config.js";
+import { assertBrowserHostState, readBrowserHostState } from "./browser-host.js";
 import { ChatGPTWebError } from "./errors.js";
 import { SELECTORS, TEXT } from "./selectors.js";
 
@@ -539,57 +539,13 @@ function absoluteChatUrl(href) {
   return new URL(href, CHATGPT_URL).toString();
 }
 
-async function freeLoopbackPort() {
-  const server = net.createServer();
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const address = server.address();
-  const port = typeof address === "object" && address ? address.port : null;
-  await new Promise((resolve) => server.close(resolve));
-  if (!port) throw new Error("无法分配本机调试端口。");
-  return port;
-}
-
-async function waitForChromeEndpoint(port, process, stderrLines) {
-  const endpoint = `http://127.0.0.1:${port}`;
-  const deadline = Date.now() + ACTION_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    if (process.exitCode != null) {
-      throw new Error(
-        `Chrome 在控制通道就绪前退出（${process.exitCode}）：${stderrLines.join("").slice(-1200)}`,
-      );
-    }
-    try {
-      const response = await fetch(`${endpoint}/json/version`);
-      if (response.ok) return endpoint;
-    } catch {
-      // Chrome is still starting.
-    }
-    await new Promise((resolve) => setTimeout(resolve, 150));
-  }
-  throw new Error(`等待 Chrome 本机控制通道超时：${endpoint}`);
-}
-
 async function navigate(page, url, options, signal) {
   await waitForPageInteraction("navigate", signal);
   return page.goto(url, options);
 }
 
-async function chromeEndpoint(port) {
-  if (!Number.isInteger(port) || port < 1 || port > 65_535) return null;
-  const endpoint = `http://127.0.0.1:${port}`;
-  try {
-    const response = await fetch(`${endpoint}/json/version`);
-    return response.ok ? endpoint : null;
-  } catch {
-    return null;
-  }
-}
-
 function browserSessionId(state) {
-  const startedAt = Number(state?.startedAt || 0);
+  const startedAt = Date.parse(state?.started_at || state?.startedAt || "") || 0;
   if (!startedAt) return null;
   return [startedAt, Number(state?.pid || 0), Number(state?.port || 0)].join(":");
 }
@@ -597,9 +553,10 @@ function browserSessionId(state) {
 async function browserSessionSnapshot() {
   const state = await readBrowserState();
   const port = Number(state?.port);
+  const startedAt = Date.parse(state?.started_at || state?.startedAt || "") || null;
   const snapshot = {
     browserRunning: false,
-    browserStartedAt: Number(state?.startedAt || 0) || null,
+    browserStartedAt: startedAt,
     browserSessionId: browserSessionId(state),
     chatgptPageOpen: false,
     chatgptPageId: null,
@@ -610,8 +567,8 @@ async function browserSessionSnapshot() {
     const response = await fetch(`http://127.0.0.1:${port}/json/list`);
     if (!response.ok) return snapshot;
     const targets = await response.json();
-    const chatgptPage = Array.isArray(targets)
-      ? targets.find((target) => {
+    const chatgptPages = Array.isArray(targets)
+      ? targets.filter((target) => {
           if (target?.type !== "page") return false;
           try {
             return /(^|\.)chatgpt\.com$/i.test(new URL(target.url).hostname);
@@ -619,11 +576,18 @@ async function browserSessionSnapshot() {
             return false;
           }
         })
-      : null;
+      : [];
+    const binding = await readAgentBinding();
+    const boundPages = binding?.conversation_id
+      ? chatgptPages.filter((target) => conversationIdFromUrl(target.url) === binding.conversation_id)
+      : [];
+    const chatgptPage = boundPages.length === 1 ? boundPages[0] : null;
     return {
       ...snapshot,
       browserRunning: true,
-      chatgptPageOpen: Boolean(chatgptPage),
+      chatgptPageOpen: binding?.conversation_id
+        ? Boolean(chatgptPage)
+        : chatgptPages.length > 0,
       chatgptPageId: chatgptPage?.id || null,
     };
   } catch {
@@ -632,11 +596,7 @@ async function browserSessionSnapshot() {
 }
 
 async function readBrowserState() {
-  try {
-    return JSON.parse(await fs.readFile(BROWSER_STATE_FILE, "utf8"));
-  } catch {
-    return null;
-  }
+  return readBrowserHostState();
 }
 
 async function readAgentBinding() {
@@ -649,18 +609,22 @@ async function readAgentBinding() {
   }
 }
 
-async function writeBrowserState(value) {
-  await fs.mkdir(path.dirname(BROWSER_STATE_FILE), { recursive: true });
-  await fs.writeFile(BROWSER_STATE_FILE, `${JSON.stringify(value, null, 2)}\n`, {
-    mode: 0o600,
-  });
-}
-
 async function readRuntimeState() {
   try {
     return JSON.parse(await fs.readFile(RUNTIME_STATE_FILE, "utf8"));
   } catch {
     return {};
+  }
+}
+
+async function writeJsonAtomically(filePath, value) {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const temporaryPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await fs.writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+    await fs.rename(temporaryPath, filePath);
+  } finally {
+    await fs.unlink(temporaryPath).catch(() => {});
   }
 }
 
@@ -888,42 +852,53 @@ async function clearStaleActiveGeneration(runtime) {
   };
 }
 
-async function acquireOperationLock(operation, signal) {
-  await fs.mkdir(path.dirname(OPERATION_LOCK_FILE), { recursive: true });
+export function operationLockPath({ agentId = AGENT_ID, conversationId = null } = {}) {
+  const scope = conversationId
+    ? `conversation:${conversationId}`
+    : `agent:${agentId || "shared"}`;
+  if (conversationId && !/^[a-zA-Z0-9-]+$/.test(conversationId)) {
+    throw new ChatGPTWebError("conversation_id 格式无效，无法生成浏览器操作锁。");
+  }
+  const digest = createHash("sha256").update(scope).digest("hex");
+  return path.join(OPERATION_LOCK_DIR, `${digest}.lock`);
+}
+
+async function acquireOperationLock(lockFile, operation, signal) {
+  await fs.mkdir(path.dirname(lockFile), { recursive: true });
   const deadline = Date.now() + ACTION_TIMEOUT_MS;
   const token = `${process.pid}-${Date.now()}`;
   while (Date.now() < deadline) {
     throwIfAborted(signal);
     let handle;
     try {
-      handle = await fs.open(OPERATION_LOCK_FILE, "wx", 0o600);
+      handle = await fs.open(lockFile, "wx", 0o600);
       await handle.writeFile(
         `${JSON.stringify({ pid: process.pid, operation, startedAt: Date.now(), token })}\n`,
       );
       return async () => {
         await handle.close().catch(() => {});
         const current = await fs
-          .readFile(OPERATION_LOCK_FILE, "utf8")
+          .readFile(lockFile, "utf8")
           .then((value) => JSON.parse(value))
           .catch(() => null);
-        if (current?.token === token) await fs.unlink(OPERATION_LOCK_FILE).catch(() => {});
+        if (current?.token === token) await fs.unlink(lockFile).catch(() => {});
       };
     } catch (error) {
       await handle?.close().catch(() => {});
       if (error?.code !== "EEXIST") throw error;
       const owner = await fs
-        .readFile(OPERATION_LOCK_FILE, "utf8")
+        .readFile(lockFile, "utf8")
         .then((value) => JSON.parse(value))
         .catch(() => null);
       if (!processIsAlive(Number(owner?.pid))) {
-        await fs.unlink(OPERATION_LOCK_FILE).catch(() => {});
+        await fs.unlink(lockFile).catch(() => {});
         continue;
       }
       await waitWithAbort(100, signal);
     }
   }
   const owner = await fs
-    .readFile(OPERATION_LOCK_FILE, "utf8")
+    .readFile(lockFile, "utf8")
     .then((value) => JSON.parse(value))
     .catch(() => null);
   throw new ChatGPTWebError("另一个 ChatGPT MCP 操作仍在进行，已拒绝并发控制网页。", {
@@ -959,7 +934,6 @@ export function parseAdvancedRowValue(text, labels) {
 
 export class ChatGPTBrowser {
   #browser = null;
-  #chromeProcess = null;
   #context = null;
   #page = null;
   #queue = Promise.resolve();
@@ -1040,27 +1014,11 @@ export class ChatGPTBrowser {
     }
   }
 
-  async close({ terminateBrowser = false } = {}) {
-    const chromeProcess = this.#chromeProcess;
+  async close() {
     if (this.#browser) {
       await this.#browser.close().catch(() => {});
     }
-    if (terminateBrowser) {
-      const state = await readBrowserState();
-      const pid = chromeProcess?.pid || state?.pid;
-      if (chromeProcess && chromeProcess.exitCode == null) chromeProcess.kill("SIGTERM");
-      else if (Number.isInteger(pid)) {
-        try {
-          process.kill(pid, "SIGTERM");
-        } catch {
-          // The persistent browser may already be gone.
-        }
-      }
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      await fs.unlink(BROWSER_STATE_FILE).catch(() => {});
-    }
     this.#browser = null;
-    this.#chromeProcess = null;
     this.#context = null;
     this.#page = null;
     this.#signedInUntil = 0;
@@ -1068,17 +1026,23 @@ export class ChatGPTBrowser {
     this.#answerTier = null;
   }
 
-  async runExclusive(operation, { signal, name = "tool-call" } = {}) {
+  async runExclusive(operation, {
+    signal,
+    name = "tool-call",
+    conversationId = null,
+    agentId = AGENT_ID,
+  } = {}) {
     const execute = async () => {
       throwIfAborted(signal);
-      const release = await acquireOperationLock(name, signal);
+      const lockFile = operationLockPath({ agentId, conversationId });
+      const release = await acquireOperationLock(lockFile, name, signal);
       this.#requestSignal = signal || null;
       try {
         return await raceWithAbort(operation(), signal, () => this.close());
       } finally {
         this.#requestSignal = null;
-        // Only disconnect the local CDP controller. The dedicated Chrome
-        // process and its ChatGPT tabs remain open for the next call.
+        // Disconnect only this Agent's CDP controller; the shared Chrome Host
+        // and every Agent's tabs remain open.
         await this.close();
         await release();
       }
@@ -1104,6 +1068,55 @@ export class ChatGPTBrowser {
     const lastSendAt = Date.now();
     await updateRuntimeState({ lastSendAt });
     return lastSendAt;
+  }
+
+  async withSendSlot(operation, signal = this.signal()) {
+    const deadline = Date.now() + ACTION_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      throwIfAborted(signal);
+      const release = await acquireOperationLock(SEND_SCHEDULER_LOCK_FILE, "account-send-slot", signal);
+      let waitMs = 0;
+      let lockReleased = false;
+      try {
+        let state = {};
+        try {
+          state = JSON.parse(await fs.readFile(SEND_SCHEDULER_FILE, "utf8"));
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+        }
+        const now = Date.now();
+        const nextAllowedAt = Number(state.next_allowed_at || 0);
+        if (nextAllowedAt > now) {
+          waitMs = nextAllowedAt - now;
+        } else {
+          let attempted = false;
+          try {
+            attempted = true;
+            return await operation();
+          } finally {
+            try {
+              if (attempted) {
+                const attemptedAt = Date.now();
+                await writeJsonAtomically(SEND_SCHEDULER_FILE, {
+                  schema_version: 1,
+                  last_attempted_at: attemptedAt,
+                  next_allowed_at: attemptedAt + Math.max(0, SEND_INTERVAL_MS),
+                });
+              }
+            } finally {
+              await release();
+              lockReleased = true;
+            }
+          }
+        }
+      } finally {
+        if (!lockReleased) await release();
+      }
+      await waitWithAbort(Math.min(waitMs, 250), signal);
+    }
+    throw new ChatGPTWebError("等待共享 ChatGPT 账号发送时隙超时；消息尚未提交。", {
+      sendIntervalMs: SEND_INTERVAL_MS,
+    });
   }
 
   async click(target, interaction, options) {
@@ -1323,128 +1336,99 @@ export class ChatGPTBrowser {
   }
 
   async launch() {
+    const binding = await readAgentBinding();
     if (this.#context && this.#page && !this.#page.isClosed()) {
-      return this.#page;
-    }
-
-    await fs.mkdir(USER_DATA_DIR, { recursive: true });
-
-    if (!CHROME_EXECUTABLE) {
-      throw new ChatGPTWebError(
-        "没有检测到 Chrome、Chromium 或 Edge。请安装浏览器，或设置 CHATGPT_WEB_CHROME。",
-        { platform: process.platform, environmentVariable: "CHATGPT_WEB_CHROME" },
-      );
+      const routeMatches = binding?.conversation_id
+        ? conversationIdFromUrl(this.#page.url()) === binding.conversation_id
+        : !AGENT_ID || await this.isAgentPage(this.#page);
+      if (routeMatches) return this.#page;
+      await this.close();
     }
 
     let openedChatGPTPage = false;
     try {
-      const prior = await readBrowserState();
-      const priorEndpoint = await chromeEndpoint(Number(prior?.port));
-      if (priorEndpoint) {
-        this.#browser = await chromium.connectOverCDP(priorEndpoint);
-        this.#context = this.#browser.contexts()[0];
-        if (!this.#context) throw new Error("常驻 Chrome 没有返回默认浏览器上下文。");
-      }
-
-      if (!this.#context && prior?.lastFailureAt) {
-        const remaining = RECONNECT_DELAY_MS - (Date.now() - Number(prior.lastFailureAt));
-        if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
-      }
-
-      if (!this.#context) {
-        await this.siteAction("launch-chatgpt");
-        const port = await freeLoopbackPort();
-        const stderrLines = [];
-        const args = [
-          `--user-data-dir=${USER_DATA_DIR}`,
-          "--profile-directory=Default",
-          `--remote-debugging-port=${port}`,
-          "--remote-debugging-address=127.0.0.1",
-          "--no-first-run",
-          "--no-default-browser-check",
-          "--disable-background-mode",
-          "--start-maximized",
-          "--new-window",
-        ];
-        if (HEADLESS) args.push("--headless=new");
-        args.push(CHATGPT_URL);
-
-        this.#chromeProcess = spawn(CHROME_EXECUTABLE, args, {
-          detached: true,
-          stdio: ["ignore", "ignore", "ignore"],
-        });
-        this.#chromeProcess.unref();
-        openedChatGPTPage = true;
-
-        const endpoint = await waitForChromeEndpoint(port, this.#chromeProcess, stderrLines);
-        this.#browser = await chromium.connectOverCDP(endpoint);
-        this.#context = this.#browser.contexts()[0];
-        if (!this.#context) throw new Error("Chrome 没有返回默认浏览器上下文。");
-        await writeBrowserState({
-          port,
-          pid: this.#chromeProcess.pid,
-          startedAt: Date.now(),
-          profile: USER_DATA_DIR,
-        });
-        await updateRuntimeState({ authenticatedUntil: 0 });
-      }
+      const host = await assertBrowserHostState(await readBrowserHostState());
+      this.#browser = await chromium.connectOverCDP(host.endpoint);
+      this.#context = this.#browser.contexts()[0];
+      if (!this.#context) throw new Error("共享 Chrome Host 没有返回默认浏览器上下文。");
     } catch (error) {
-      await writeBrowserState({
-        ...(await readBrowserState()),
-        lastFailureAt: Date.now(),
-        profile: USER_DATA_DIR,
-      }).catch(() => {});
       const message = error instanceof Error ? error.message : String(error);
-      if (/SingletonLock|profile.*in use|ProcessSingleton|already running/i.test(message)) {
-        throw new ChatGPTWebError(
-          "ChatGPT MCP 的专用浏览器配置正在被另一个进程使用。请关闭登录窗口或另一个 MCP 实例后重试。",
-          { profile: USER_DATA_DIR },
-        );
-      }
-      throw new ChatGPTWebError("无法启动 ChatGPT MCP 的专用浏览器。", {
+      throw new ChatGPTWebError("无法连接共享 ChatGPT Browser Host；已停止 Agent 路由。", {
         cause: message,
-        chrome: CHROME_EXECUTABLE,
         profile: USER_DATA_DIR,
+        hostRoot: BROWSER_HOST_ROOT,
+        recovery: "检查共享 Host 状态；必要时重启 MCP 以重新执行 Browser Host Ensure。",
       });
     }
 
     this.#context.setDefaultTimeout(ACTION_TIMEOUT_MS);
-    const binding = await readAgentBinding();
     const chatPages = this.#context.pages().filter((page) => /chatgpt\.com/i.test(page.url()));
-    const boundPage = binding?.conversation_id
-      ? chatPages.find((page) => conversationIdFromUrl(page.url()) === binding.conversation_id)
-      : null;
-    if (binding?.conversation_id && !boundPage) {
-      throw new ChatGPTWebError("绑定的专属对话标签页不存在；已停止路由。", {
+    const boundPages = binding?.conversation_id
+      ? chatPages.filter((page) => conversationIdFromUrl(page.url()) === binding.conversation_id)
+      : [];
+    if (boundPages.length > 1) {
+      throw new ChatGPTWebError("共享浏览器中有多个标签页打开了本 Agent 的绑定对话；已停止路由。", {
         agentId: AGENT_ID,
         conversationId: binding.conversation_id,
-        profile: USER_DATA_DIR,
+        observedUrls: boundPages.map((page) => page.url()),
       });
     }
+    const boundPage = boundPages[0] || null;
     if (binding?.conversation_id) {
-      this.#page = boundPage;
+      const expectedId = String(binding.conversation_id);
+      let destination;
+      try {
+        destination = new URL(binding.conversation_url);
+      } catch {
+        throw new ChatGPTWebError("绑定文件中的 conversation_url 无效；已停止路由。", {
+          agentId: AGENT_ID,
+          conversationId: expectedId,
+        });
+      }
+      if (
+        destination.hostname !== "chatgpt.com" ||
+        conversationIdFromUrl(destination.toString()) !== expectedId
+      ) {
+        throw new ChatGPTWebError("绑定 URL 与 conversation_id 不匹配；已停止路由。", {
+          agentId: AGENT_ID,
+          conversationId: expectedId,
+          conversationUrl: binding.conversation_url,
+        });
+      }
+      this.#page = boundPage || (await this.#context.newPage());
+      if (!boundPage) {
+        await this.siteAction("restore-bound-conversation");
+        await navigate(this.#page, destination.toString(), { waitUntil: "domcontentloaded" }, this.signal());
+        openedChatGPTPage = true;
+      }
+      if (conversationIdFromUrl(this.#page.url()) !== expectedId) {
+        throw new ChatGPTWebError("恢复的标签页未打开绑定对话；已停止路由。", {
+          agentId: AGENT_ID,
+          conversationId: expectedId,
+          observedUrl: this.#page.url(),
+        });
+      }
     } else if (AGENT_ID) {
-      const agentPage = await (async () => {
-        for (const page of chatPages) {
-          if (await this.isAgentPage(page)) return page;
-        }
-        return null;
-      })();
+      const agentPages = [];
+      for (const page of chatPages) {
+        if (await this.isAgentPage(page)) agentPages.push(page);
+      }
+      if (agentPages.length > 1) {
+        throw new ChatGPTWebError("共享浏览器中有多个标签页标记为本 Agent；已停止路由。", {
+          agentId: AGENT_ID,
+          observedUrls: agentPages.map((page) => page.url()),
+        });
+      }
+      const agentPage = agentPages[0] || null;
       if (agentPage) {
         this.#page = agentPage;
-      } else if (
-        chatPages.length === 1 &&
-        !conversationIdFromUrl(chatPages[0].url()) &&
-        (await this.markAgentPage(chatPages[0]))
-      ) {
-        this.#page = chatPages[0];
       } else {
         // Never guess from tab order or the active window. Create one
         // deterministic Agent-owned tab, then mark it after navigation.
         this.#page = await this.#context.newPage();
       }
     } else {
-      this.#page = chatPages[0] || (await this.#context.newPage());
+      this.#page = await this.#context.newPage();
     }
     const trackPage = (page) => {
       if (/chatgpt\.com/i.test(page.url()) && (!this.#page || this.#page.isClosed())) {
@@ -1514,6 +1498,9 @@ export class ChatGPTBrowser {
       postBreakerCooldownMs: POST_BREAKER_COOLDOWN_MS,
       historyQuietPeriodMs: HISTORY_QUIET_PERIOD_MS,
       proProbeRecheckAfterCloseMs: PRO_PROBE_RECHECK_AFTER_CLOSE_MS,
+      hostId: state?.host_id || null,
+      profile: state?.profile || null,
+      endpoint: state?.endpoint || null,
       pid: state?.pid || null,
       port: state?.port || null,
       lastSiteAction: runtime.lastSiteAction || null,
@@ -1532,36 +1519,10 @@ export class ChatGPTBrowser {
   }
 
   async terminateBrowser() {
-    const state = await readBrowserState();
-    const runtime = await readRuntimeState();
-    const closedAt = Date.now();
-    const reliableProbe =
-      runtime.proProbe?.policyKey === PROBE_POLICY_KEY &&
-      [
-        PROBE_ACCEPT_CLASSIFICATION,
-        PROBE_FALLBACK_CLASSIFICATION,
-        PROBE_NETWORK_ACCEPT_CLASSIFICATION,
-      ].includes(
-        runtime.proProbe?.classification,
-      )
-        ? {
-            ...runtime.proProbe,
-            sessionInterruptedAt: closedAt,
-            recheckAfter: closedAt + PRO_PROBE_RECHECK_AFTER_CLOSE_MS,
-            expiresAt: closedAt + PRO_PROBE_RECHECK_AFTER_CLOSE_MS,
-          }
-        : null;
-    await this.close({ terminateBrowser: true });
-    await updateRuntimeState({
-      authenticatedUntil: 0,
-      proProbe: reliableProbe,
-      ...interruptedGenerationFields(runtime, closedAt),
-    });
-    return {
-      closed: true,
-      pid: state?.pid || null,
-      proProbeRecheckAfter: reliableProbe?.recheckAfter || null,
-    };
+    throw new ChatGPTWebError(
+      "Agent MCP 不能关闭共享浏览器。请在所有 Agent 断开后，由用户显式运行 Browser Host 管理器的 -Action Stop。",
+      { hostRoot: BROWSER_HOST_ROOT },
+    );
   }
 
   async page() {
@@ -1570,20 +1531,34 @@ export class ChatGPTBrowser {
     const livePages = this.#context
       .pages()
       .filter((page) => !page.isClosed() && /chatgpt\.com/i.test(page.url()));
-    const liveChatGPTPage = binding?.conversation_id
-      ? livePages.find((page) => conversationIdFromUrl(page.url()) === binding.conversation_id)
-      : AGENT_ID && this.#page && !this.#page.isClosed() &&
-          /chatgpt\.com/i.test(this.#page.url()) &&
-          await this.isAgentPage(this.#page)
-        ? this.#page
-        : AGENT_ID
-          ? await (async () => {
-              for (const page of livePages) {
-                if (await this.isAgentPage(page)) return page;
-              }
-              return null;
-            })()
-          : livePages[0];
+    let liveChatGPTPage = null;
+    if (binding?.conversation_id) {
+      const matchingPages = livePages.filter(
+        (page) => conversationIdFromUrl(page.url()) === binding.conversation_id,
+      );
+      if (matchingPages.length > 1) {
+        throw new ChatGPTWebError("共享浏览器中有多个标签页打开了本 Agent 的绑定对话；已停止路由。", {
+          agentId: AGENT_ID,
+          conversationId: binding.conversation_id,
+          observedUrls: matchingPages.map((page) => page.url()),
+        });
+      }
+      liveChatGPTPage = matchingPages[0] || null;
+    } else if (AGENT_ID) {
+      const markedPages = [];
+      for (const page of livePages) {
+        if (await this.isAgentPage(page)) markedPages.push(page);
+      }
+      if (markedPages.length > 1) {
+        throw new ChatGPTWebError("共享浏览器中有多个标签页标记为本 Agent；已停止路由。", {
+          agentId: AGENT_ID,
+          observedUrls: markedPages.map((page) => page.url()),
+        });
+      }
+      liveChatGPTPage = markedPages[0] || null;
+    } else {
+      liveChatGPTPage = livePages[0] || null;
+    }
     if (binding?.conversation_id && !liveChatGPTPage) {
       throw new ChatGPTWebError("当前标签页不属于本 Agent 的绑定对话；已停止读写。", {
         agentId: AGENT_ID,
@@ -1633,6 +1608,7 @@ export class ChatGPTBrowser {
       url: page.url(),
       conversationId: conversationIdFromUrl(page.url()),
       profile: USER_DATA_DIR,
+      hostId: state?.host_id || null,
       pid: state?.pid || null,
       port: state?.port || null,
     };
@@ -3878,12 +3854,14 @@ export class ChatGPTBrowser {
     const userBeforeSnapshot = await this.userMessageSnapshot();
     const userBefore = userBeforeSnapshot.count;
     await this.siteAction("send-prompt");
-    const send = await this.firstVisible(SELECTORS.sendButton, { timeout: 1_000 });
-    if (send && (await send.isEnabled().catch(() => true))) {
-      await this.domClick(send, "send-prompt-click");
-    } else {
-      await this.press(composer, "Enter", "send-prompt-enter");
-    }
+    await this.withSendSlot(async () => {
+      const send = await this.firstVisible(SELECTORS.sendButton, { timeout: 1_000 });
+      if (send && (await send.isEnabled().catch(() => true))) {
+        await this.domClick(send, "send-prompt-click");
+      } else {
+        await this.press(composer, "Enter", "send-prompt-enter");
+      }
+    });
     await this.markSendPerformed();
 
     const generationStartedAt = Date.now();

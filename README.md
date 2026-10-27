@@ -2,24 +2,28 @@
 
 [简体中文](README.zh-CN.md)
 
-A Codex Skill and PowerShell helper for giving each Windows Agent its own `chatgpt-web-mcp` process, Chrome Profile, CDP port, state/log paths, and conversation binding.
+This Skill lets local Codex conversations use **one already-signed-in Chrome browser and Profile**. Every conversation keeps its own `chatgpt-web-mcp` process, MCP entry, Agent ID, state/log directories, and ChatGPT conversation binding. Starting a new Codex conversation does not create another Chrome Profile or prompt for another sign-in.
+
+Agents share only the Browser Host and login session; each Agent must bind a different `conversation_id`. This does not provide browser-process or credential isolation. Do not claim cross-Agent concurrency is verified until the live two-Agent send/reply check has passed.
 
 ## Requirements
 
-- Windows 10/11 and Codex Desktop
-- An existing `chatgpt-web-mcp` checkout with its dependencies already installed
-- Node.js and Chrome or Edge already installed
-- The bundled runtime overlay matches `chatgpt-web-mcp` `0.2.1` at commit `d6c1909151d9d13b439af1f519513ebee2267893`
+- Windows 10/11, Codex Desktop, and PowerShell
+- An existing `chatgpt-web-mcp` checkout with its dependencies installed
+- Node.js and Chrome or Edge
+- An already-signed-in Chrome user data directory; the bundled runtime overlay targets `chatgpt-web-mcp` `0.2.1` at commit `d6c1909151d9d13b439af1f519513ebee2267893`
 
-For a different source revision, use a compatible Agent runtime template or review and adapt the overlay. The helper refuses a different package version or Git revision when using the bundled files.
+For a different source revision, use a compatible Agent runtime template or review and adapt the overlay first. The helper refuses a mismatched version or commit.
 
 ## Install the Skill
 
-Clone this repository and copy the repository root into `%USERPROFILE%\.agents\skills\chatgpt-web-agent-channel`, or use your preferred Codex Skill installer. The repository root contains `SKILL.md`.
+Clone this repository and copy its root to `%USERPROFILE%\.agents\skills\chatgpt-web-agent-channel`, or use the Codex Skill installer.
 
-## Create an Agent instance
+## Join the already-signed-in browser
 
-Choose one stable, unique ID for the Agent and run the helper from PowerShell:
+When `%USERPROFILE%\.chatgpt-web-mcp\browser-host\host.json` exists and passes `Status`, new Agents reuse its exact Profile, Chrome process, and CDP port. Omit `-BrowserHostProfile` when joining that Host.
+
+For the first Host setup, pass the path to an **existing signed-in Chrome user data directory**. It is the parent of `Default`, `Profile 1`, or another Chrome profile directory. Do not pass the `Default` child or a path that does not exist:
 
 ```powershell
 & '.\scripts\new-agent-instance.ps1' `
@@ -27,19 +31,40 @@ Choose one stable, unique ID for the Agent and run the helper from PowerShell:
   -SourceDir 'C:\path\to\chatgpt-web-mcp' `
   -NodeExecutable 'C:\path\to\node.exe' `
   -ChromeExecutable 'C:\Program Files\Google\Chrome\Application\chrome.exe' `
-  -CodexConfigPath "$env:USERPROFILE\.codex\config.toml"
+  -CodexConfigPath "$env:USERPROFILE\.codex\config.toml" `
+  -BrowserHostProfile '<existing signed-in Chrome user data directory>'
 ```
 
-If the checkout differs from the bundled revision, add `-TemplateAgentRoot` pointing at a healthy Agent instance that uses this same source checkout. The helper creates only new Agent-specific directories and an independently named Codex MCP entry; it reuses `node_modules` and leaves existing Agents untouched.
+If Chrome already uses that Profile with a verifiable CDP endpoint, the helper adopts it. If Chrome is running without CDP, setup stops; it will not launch another browser or create a Profile. A browser restart requires the user's approval and must reuse the same directory. Chrome 136 and later do not allow remote debugging against Chrome's default data directory. If the existing browser cannot provide the required endpoint, setup stops instead of creating a new per-Agent Profile. See [Chrome's remote-debugging change](https://developer.chrome.com/blog/remote-debugging-port).
 
-The first `agent-call.mjs chatgpt_status` launches Chrome with the new empty Profile. Sign in normally in that Profile, then bind a new conversation as described in `SKILL.md`.
+Once the shared Host is valid, use the same command with a new stable Agent ID for each Codex conversation and omit `-BrowserHostProfile`. The helper creates only Agent-specific MCP, state, log, and binding resources. Every Agent's `browser_profile` points to the same Host Profile. It never copies cookies, tokens, or Profile data.
 
-## Isolation model
+## Migrate an existing Agent
 
-Each named stdio server starts its own Node process. The launcher gives it a unique Chrome Profile and per-Agent browser/runtime state paths. The source allocates and persists an available loopback CDP port. The binding records one real conversation ID and URL, and routing checks use the Agent ID and conversation ID.
+Disconnect the selected Agent's MCP normally, then run:
 
-The Skill never copies cookies, tokens, or another Agent's state. Cross-Agent concurrency is only reported as verified after two independent Agents complete a simultaneous unique-message test.
+```powershell
+& '.\scripts\migrate-agent-to-shared-browser.ps1' `
+  -AgentId 'ag-codex-existing-id' `
+  -Root "$env:USERPROFILE\.chatgpt-web-mcp"
+```
+
+If no shared Host exists, also pass `-BrowserHostProfile '<existing signed-in Chrome user data directory>'`. Migration changes only the selected Agent and preserves its ID, MCP name, bound conversation ID, message cursors, state, and logs. It does not copy, delete, or open the old Agent Profile. Review the backup created in `archives` before migration.
+
+## Reconnect, inspect, and stop
+
+- Restart the same named MCP entry to reconnect. Do not create a new Agent ID for each restart.
+- Inspect the Host:
+
+  ```powershell
+  & '.\scripts\browser-host.ps1' -Action Status `
+    -HostRoot "$env:USERPROFILE\.chatgpt-web-mcp\browser-host"
+  ```
+
+- Disconnecting one Agent leaves Chrome open. Stop the Host only after every Agent has disconnected and the user explicitly asks to close it.
+
+Every send/read routes by the current Agent's bound `conversation_id`, never by tab order or active-tab state. Agent message logs and reply cursors remain separate. Writes to the same conversation are serialized, and the shared scheduler coordinates account-level send intervals. Report concurrency as unverified until two Agents pass the live simultaneous send/reply check.
 
 ## License
 
-This Skill and its helper scripts are MIT licensed; see `LICENSE`. The bundled runtime overlay is based on the upstream MIT-licensed `Goudu666/chatgpt-web-mcp`; see `UPSTREAM-LICENSES/chatgpt-web-mcp-MIT.txt`.
+This Skill and its helpers are MIT licensed; see [`LICENSE`](LICENSE). The runtime overlay is based on upstream MIT-licensed `Goudu666/chatgpt-web-mcp`; see [`UPSTREAM-LICENSES/chatgpt-web-mcp-MIT.txt`](UPSTREAM-LICENSES/chatgpt-web-mcp-MIT.txt).

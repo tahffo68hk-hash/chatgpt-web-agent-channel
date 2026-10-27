@@ -2,6 +2,10 @@
 
 Date: 2026-10-27
 
+## Implementation status
+
+The repository now contains the shared Browser Host manager, per-Agent attach/routing changes, provisioning and explicit Profile adoption helpers, and bilingual usage documentation. Static Node and PowerShell syntax checks have passed. No live ChatGPT sign-in/reconnect or two-Agent simultaneous send/reply test has been run in this change, so cross-Agent concurrency is not yet verified.
+
 [简体中文](2026-10-27-shared-chatgpt-browser-design-zh-CN.md)
 
 ## Problem
@@ -19,10 +23,10 @@ This design shares the browser login session; it does not make multiple Codex co
 ### Shared Browser Host
 
 - Add one persistent Browser Host under the common `chatgpt-web-mcp` root. It owns one Chrome process, one shared Profile, one dynamically allocated loopback CDP port, browser state, and lifecycle lock.
-- The first setup creates the host if absent. Later Agent setups discover and reuse its persisted state. Concurrent startup must be protected by the host lifecycle lock so two setups cannot launch Chrome against the same Profile.
+- The first setup registers an explicitly selected, existing signed-in Chrome user-data directory as the Host. Later Agent setups discover and reuse its persisted state. A named Windows mutex derived from the canonical Host root serializes concurrent startup, adoption, and shutdown. Setup never creates a new Chrome Profile.
 - Chrome is the only process allowed to open the shared Profile. Browser Host startup validates the recorded PID, Profile path, and CDP port before reusing the endpoint.
 - Only the Browser Host manager may launch or terminate Chrome. Agent MCP processes attach over CDP and disconnect their own controller when an MCP call ends. An Agent lifecycle call must not terminate the shared Chrome process.
-- The user signs in normally once in the Browser Host Profile. Existing cookies are never copied from another Profile.
+- The chosen Host Profile is the user's existing login session. Existing cookies are never copied from another Profile. If Chrome cannot expose a verifiable CDP endpoint, setup stops instead of launching a per-Agent Profile.
 
 ### Per-Agent MCP and Conversation Routing
 
@@ -34,7 +38,7 @@ This design shares the browser login session; it does not make multiple Codex co
 
 ### Concurrency and Lifecycle
 
-- Keep one browser lifecycle lock shared across all Agent instances to serialize host creation, health checks that can mutate host state, and shutdown.
+- Keep one named browser lifecycle mutex shared across all Agent instances to serialize host creation, adoption, and shutdown.
 - Keep writes to one ChatGPT conversation serialized by a lock keyed to that conversation ID. Different conversations use different locks and target different page objects.
 - Use a shared account-level send scheduler so multiple MCP processes honor the configured minimum send interval together, instead of independently applying a per-process interval.
 - Recheck the bound conversation ID immediately before a send and verify the reply on the same page. On timeout, inspect that conversation before retrying.
@@ -44,14 +48,15 @@ This design shares the browser login session; it does not make multiple Codex co
 ## Setup and Compatibility
 
 - Update the PowerShell helper, launcher, runtime overlay, and English/Chinese READMEs to provision or join the shared Browser Host while retaining per-Agent resources.
-- New Agent setup reuses the existing host if its manifest and process checks pass; otherwise it bootstraps one host and asks the user to sign in in that Profile.
-- Existing per-Agent Profiles are left untouched. An existing installation joins the shared host only through an explicit migration step after the user chooses the host Profile. The selected existing Profile may be adopted in place, preserving its current login without copying cookies. If Chrome already owns that Profile, migration must verify and adopt its live PID/CDP endpoint rather than launch another Chrome process against it.
+- New Agent setup requires a verified Host or an explicit path to the user's existing signed-in Chrome user-data directory. If the Host is absent, the helper registers or starts only that same existing directory; it never provisions `browser-host\profile` or an Agent-specific Profile.
+- Existing per-Agent Profiles are left untouched and unused after migration. An existing installation joins the already-registered shared Host through an explicit migration step. The selected Host Profile is reused in place without copying cookies. If Chrome already owns that Profile without a verifiable CDP endpoint, migration stops and asks the user before any restart.
+- Chrome 136 and later ignores remote-debugging switches for the default Chrome data directory. If the selected existing browser cannot expose the CDP endpoint this MCP requires, the Skill stops and does not create a replacement Profile.
 - Runtime and startup errors must identify whether the issue is the host, Agent binding, or target conversation, and must give a recovery step that preserves the other Agents' files and processes.
 
 ## Acceptance Checks
 
-1. The first Agent starts one Browser Host; a second Agent attaches to the same Chrome PID, Profile, and CDP port without launching another Chrome process.
-2. Signing in once in the host Profile remains effective for a newly configured Agent and after an MCP process restart.
+1. The first Agent registers one existing signed-in Chrome user-data directory as Browser Host; a second Agent attaches to the same Chrome PID, Profile, and CDP port. No new Profile is created.
+2. The existing login remains effective for newly configured Agents and after an MCP process restart.
 3. Two Agent bindings point to distinct conversation IDs. Each Agent opens and reads only its own conversation even when the tabs are reordered and focus changes.
 4. Concurrent sends to those distinct conversations are routed to the correct pages, respect the shared send scheduler, and produce replies attributed to the matching conversation IDs.
 5. Same-conversation writes serialize. A timed-out send is checked before a retry.
@@ -62,4 +67,4 @@ This design shares the browser login session; it does not make multiple Codex co
 
 - All Agents using the host share the same authenticated ChatGPT account session. Conversation routing remains separate, but the browser login is intentionally shared.
 - One Chrome process and account-wide send pacing can limit throughput. Different conversations may have separate write locks, but observed ChatGPT account limits still apply.
-- Existing per-Agent installations need an explicit migration decision; automatically copying Profile data would violate the no-cookie-copy requirement.
+- Chrome must expose a supported CDP endpoint. The Skill does not silently replace an incompatible normal browser with a new Profile, because doing so would require another sign-in and change the user's requested session.
