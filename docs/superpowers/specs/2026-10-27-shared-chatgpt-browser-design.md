@@ -2,6 +2,8 @@
 
 Date: 2026-10-27
 
+[简体中文](2026-10-27-shared-chatgpt-browser-design-zh-CN.md)
+
 ## Problem
 
 The current helper creates a Chrome Profile, CDP state file, and browser lifecycle for every Agent ID. A new Codex conversation therefore starts a fresh Profile and requires another ChatGPT sign-in. The user wants one persistent, signed-in browser reused by multiple Codex conversations while each conversation continues to use its own ChatGPT conversation ID.
