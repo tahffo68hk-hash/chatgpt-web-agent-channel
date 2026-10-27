@@ -3,3 +3,4 @@ bindings/
 logs/
 profiles/
 state/
+.worktrees/
